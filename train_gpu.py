@@ -76,7 +76,7 @@ def play_game_collect_experience(model, device='cpu', epsilon=0.0):
                 if not moved:
                     continue
                 
-                state_tensor = torch.from_numpy(afterstate_grid.flatten().astype(np.int64)).long().to(device)
+                state_tensor = torch.from_numpy(afterstate_grid.flatten().astype(np.int64)).long().unsqueeze(0).to(device)
                 with torch.no_grad():
                     value = model(state_tensor).item()
                 
