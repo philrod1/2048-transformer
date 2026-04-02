@@ -36,7 +36,7 @@ class Board2048Transformer(nn.Module):
         x = x + self.position_embedding  # Add positional info
         
         # Transformer expects [seq_len, batch, embedding_dim]
-        x = x.transpose(0, 1)
+        # x = x.transpose(0, 1)
         
         # Self-attention over all 16 positions
         x = self.transformer(x)  # [16, batch, embedding_dim]
