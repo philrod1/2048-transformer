@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+
+# PyTorch
+*.pth
+*.pt
+checkpoint_*.pth
+final_model.pth
+
+# Logs
+*.log
+training.log
+nohup.out
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Data/results
+results/
+experiments/
+outputs/
+
+# Other
+.env
