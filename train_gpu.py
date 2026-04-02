@@ -65,30 +65,33 @@ def play_game_collect_experience(model, device='cpu', epsilon=0.0):
             best_move = np.random.choice(valid_moves)
             best_afterstate, best_reward, _ = board.get_afterstate(best_move)
         else:
-            # Greedy move from model
-            best_value = -float('inf')
-            best_move = None
-            best_afterstate = None
-            best_reward = 0
+            # Greedy move from model -- BATCHED VERSION
+            valid_moves = []
+            afterstates = []
+            rewards = []
             
+            # Collect all valid moves
             for move in range(4):
                 afterstate_grid, reward, moved = board.get_afterstate(move)
-                if not moved:
-                    continue
-                
-                state_tensor = torch.from_numpy(afterstate_grid.flatten().astype(np.int64)).long().unsqueeze(0).to(device)
-                with torch.no_grad():
-                    value = model(state_tensor).item()
-                
-                total_value = reward + value
-                if total_value > best_value:
-                    best_value = total_value
-                    best_move = move
-                    best_afterstate = afterstate_grid
-                    best_reward = reward
-        
-        if best_move is None:
-            break
+                if moved:
+                    valid_moves.append(move)
+                    afterstates.append(afterstate_grid.flatten())
+                    rewards.append(reward)
+            
+            if not valid_moves:
+                break
+            
+            # Single batched forward pass for all moves
+            batch_tensor = torch.from_numpy(np.array(afterstates)).long().to(device)
+            with torch.no_grad():
+                values = model(batch_tensor).cpu().numpy()
+            
+            # Find best move
+            total_values = np.array(rewards) + values
+            best_idx = total_values.argmax()
+            best_move = valid_moves[best_idx]
+            best_afterstate = afterstates[best_idx].reshape(4, 4)
+            best_reward = rewards[best_idx]
         
         # Store the afterstate (before random tile)
         afterstate = best_afterstate.flatten()
