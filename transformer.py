@@ -17,7 +17,8 @@ class Board2048Transformer(nn.Module):
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=embedding_dim,
             nhead=num_heads,
-            dim_feedforward=embedding_dim * 4
+            dim_feedforward=embedding_dim * 4,
+            batch_first=True
         )
         self.transformer = nn.TransformerEncoder(
             encoder_layer, 
@@ -40,8 +41,8 @@ class Board2048Transformer(nn.Module):
         # Self-attention over all 16 positions
         x = self.transformer(x)  # [16, batch, embedding_dim]
         
-        # Pool over positions (could also just use CLS token approach)
-        x = x.mean(dim=0)  # [batch, embedding_dim]
+        # Pool over positions
+        x = x.mean(dim=1)  # [batch, embedding_dim]
         
         # Predict value
         value = self.value_head(x)  # [batch, 1]
