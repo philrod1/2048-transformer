@@ -2,9 +2,13 @@ import torch
 import torch.nn as nn
 import numpy as np
 from collections import deque
+import csv
+from pathlib import Path
 import time
 from game import Board2048
 from transformer import Board2048Transformer
+
+DEVICE = 'cpu'
 
 class ExperienceReplayBuffer:
     """Store transitions for batched training"""
@@ -33,6 +37,18 @@ class ExperienceReplayBuffer:
         return len(self.buffer)
 
 
+def get_afterstate_log_reward(board, move):
+    """Get afterstate with log-scale reward instead of raw score"""
+    afterstate_grid, raw_reward, moved = board.get_afterstate(move)
+    
+    # Convert raw reward to log-scale reward
+    if raw_reward > 0:
+        log_reward = np.log2(raw_reward)
+    else:
+        log_reward = 0.0
+    
+    return afterstate_grid, log_reward, moved
+
 def play_game_collect_experience(model, device='cpu', epsilon=0.0):
     """
     Play one game and collect experience transitions
@@ -41,7 +57,7 @@ def play_game_collect_experience(model, device='cpu', epsilon=0.0):
         epsilon: Probability of random action (for exploration)
     
     Returns:
-        experiences: List of (state, reward, next_state, is_terminal)
+        experiences: List of (afterstate, reward, next_afterstate, is_terminal)
         game_score: Final score
         max_tile: Maximum tile achieved
         won: Whether 2048 was reached
@@ -50,6 +66,10 @@ def play_game_collect_experience(model, device='cpu', epsilon=0.0):
     experiences = []
     game_score = 0
     
+    # Track previous afterstate for TD learning
+    prev_afterstate = None
+    prev_reward = 0
+    
     while not board.is_game_over():
         
         # Epsilon-greedy exploration
@@ -57,13 +77,13 @@ def play_game_collect_experience(model, device='cpu', epsilon=0.0):
             # Random move
             valid_moves = []
             for move in range(4):
-                _, _, moved = board.get_afterstate(move)
+                _, _, moved = get_afterstate_log_reward(board, move)
                 if moved:
                     valid_moves.append(move)
             if not valid_moves:
                 break
             best_move = np.random.choice(valid_moves)
-            best_afterstate, best_reward, _ = board.get_afterstate(best_move)
+            best_afterstate, best_reward, _ = get_afterstate_log_reward(board, best_move)
         else:
             # Greedy move from model -- BATCHED VERSION
             valid_moves = []
@@ -72,7 +92,7 @@ def play_game_collect_experience(model, device='cpu', epsilon=0.0):
             
             # Collect all valid moves
             for move in range(4):
-                afterstate_grid, reward, moved = board.get_afterstate(move)
+                afterstate_grid, reward, moved = get_afterstate_log_reward(board, move)
                 if moved:
                     valid_moves.append(move)
                     afterstates.append(afterstate_grid.flatten())
@@ -93,21 +113,33 @@ def play_game_collect_experience(model, device='cpu', epsilon=0.0):
             best_afterstate = afterstates[best_idx].reshape(4, 4)
             best_reward = rewards[best_idx]
         
-        # Store the afterstate (before random tile)
-        afterstate = best_afterstate.flatten()
+        # If we have a previous afterstate, create a transition
+        if prev_afterstate is not None:
+            # Transition: prev_afterstate -> prev_reward -> current_afterstate
+            experiences.append((
+                prev_afterstate,
+                prev_reward,
+                best_afterstate.flatten(),
+                False  # Not terminal yet
+            ))
         
         # Make the move (adds random tile)
         board.move(best_move)
         game_score += best_reward
         
-        # Next state after random tile
-        next_state = board.grid.copy().flatten()
-        is_terminal = board.is_game_over()
+        # Store current afterstate and reward for next iteration
+        prev_afterstate = best_afterstate.flatten().copy()
+        prev_reward = best_reward
         
-        # Store transition: afterstate -> reward -> next_state
-        experiences.append((afterstate, best_reward, next_state, is_terminal))
-        
-        if is_terminal:
+        # Check if game is over after the move
+        if board.is_game_over():
+            # Terminal transition: last afterstate leads to zero value
+            experiences.append((
+                prev_afterstate,
+                0,  # No reward after terminal
+                np.zeros(16, dtype=np.uint8),  # Terminal state (all zeros)
+                True  # Terminal flag
+            ))
             break
     
     max_tile = 2 ** int(board.grid.max())
@@ -149,14 +181,14 @@ def train_batch_from_buffer(model, optimizer, replay_buffer, batch_size, device)
     loss.backward()
     
     # Gradient clipping (helps stability)
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
     
     optimizer.step()
     
     return loss.item()
 
 
-def train_gpu_batched(
+def train_batched(
     num_games=1000000,
     games_per_collection=100,
     replay_capacity=100000,
@@ -171,24 +203,9 @@ def train_gpu_batched(
     num_layers=4,
     device='cuda',
     checkpoint_every=10000,
-    log_every=100
+    log_every=100,
+    csv_log_path='training_log.csv'
 ):
-    """
-    Main training loop with GPU batching
-    
-    Args:
-        num_games: Total games to play
-        games_per_collection: Games to play before training
-        replay_capacity: Size of replay buffer
-        batch_size: Training batch size
-        train_batches_per_collection: How many training batches per collection phase
-        learning_rate: Adam learning rate
-        epsilon_start/end/decay: Exploration schedule
-        embedding_dim, num_heads, num_layers: Model architecture
-        device: 'cuda' or 'cpu'
-        checkpoint_every: Save model every N games
-        log_every: Print stats every N games
-    """
     
     # Setup
     device = torch.device(device if torch.cuda.is_available() else 'cpu')
@@ -217,6 +234,19 @@ def train_gpu_batched(
     total_max_tiles = []
     total_wins = 0
     losses = []
+
+        # Create CSV file
+    csv_file = open(csv_log_path, 'w', newline='')
+    csv_writer = csv.writer(csv_file)
+    csv_writer.writerow([
+        'games_played', 'elapsed_time', 'games_per_sec',
+        'avg_score', 'recent_avg_score', 'recent_std_score',
+        'win_rate', 'recent_win_rate',
+        'avg_loss', 'recent_loss',
+        'epsilon', 'empty_board_value',
+        'embedding_mean', 'embedding_std', 'embedding_norm',
+        'max_tile_512', 'max_tile_256', 'max_tile_128'
+    ])
     
     start_time = time.time()
     
@@ -302,7 +332,35 @@ def train_gpu_batched(
                 embedding_mean = embedding_weights.mean().item()
                 embedding_std = embedding_weights.std().item()
                 embedding_norm = embedding_weights.norm().item()
+
+            # Count specific tiles
+            tile_512_count = sum(1 for t in recent_max_tiles if t == 512)
+            tile_256_count = sum(1 for t in recent_max_tiles if t == 256)
+            tile_128_count = sum(1 for t in recent_max_tiles if t == 128)
             
+            # Write to CSV
+            csv_writer.writerow([
+                games_played,
+                elapsed,
+                games_per_sec,
+                np.mean(total_scores),
+                np.mean(recent_scores),
+                np.std(recent_scores),
+                total_wins / games_played,
+                recent_wins / recent_window,
+                np.mean(losses) if losses else 0,
+                np.mean(losses[-100:]) if losses else 0,
+                epsilon,
+                empty_value,
+                embedding_mean,
+                embedding_std,
+                embedding_norm,
+                tile_512_count,
+                tile_256_count,
+                tile_128_count
+            ])
+            csv_file.flush()
+
             print(f"\n{'='*80}")
             print(f"Games: {games_played:,}/{num_games:,} ({games_played/num_games*100:.1f}%)")
             print(f"Time: {elapsed/3600:.2f}h | Speed: {games_per_sec:.1f} games/sec | ETA: {(num_games-games_played)/games_per_sec/3600:.2f}h")
@@ -348,19 +406,20 @@ def train_gpu_batched(
         'avg_score': np.mean(total_scores[-1000:]) if len(total_scores) >= 1000 else np.mean(total_scores),
     }, final_path)
     print(f"\nFinal model saved: {final_path}")
-    
+
+    csv_file.close()
     return model
 
 
-def evaluate_model(model_path, num_games=100, device='cuda'):
+def evaluate_model(model_path, num_games, embedding_dim, num_heads, num_layers, device):
     """Evaluate a trained model"""
     device = torch.device(device if torch.cuda.is_available() else 'cpu')
     
     # Load model
-    checkpoint = torch.load(model_path, map_location=device)
+    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
     
     # Reconstruct model (adjust these if you used different architecture)
-    model = Board2048Transformer(embedding_dim=128, num_heads=8, num_layers=4).to(device)
+    model = Board2048Transformer(embedding_dim, num_heads, num_layers).to(device)
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
     
@@ -392,24 +451,53 @@ def evaluate_model(model_path, num_games=100, device='cuda'):
 
 
 if __name__ == "__main__":
+    if DEVICE == 'cpu':
+        embedding_dim = 64
+        num_heads = 4
+        num_layers = 2
+    else:
+        embedding_dim = 128
+        num_heads = 8
+        num_layers = 4
     # Train
-    model = train_gpu_batched(
-        num_games=1000000,
-        games_per_collection=100,
-        batch_size=256,
-        train_batches_per_collection=10,
-        learning_rate=0.0001,
-        epsilon_start=0.1,
-        epsilon_end=0.01,
-        epsilon_decay_games=100000,
-        embedding_dim=128,
-        num_heads=8,
-        num_layers=4,
-        device='cuda',
-        checkpoint_every=10000,
-        log_every=1000
-    )
+    if DEVICE == 'cuda':
+        model = train_batched(
+            num_games=1000000,
+            games_per_collection=100,
+            batch_size=256,
+            train_batches_per_collection=10,
+            learning_rate=0.00001,
+            epsilon_start=0.1,
+            epsilon_end=0.01,
+            epsilon_decay_games=100000,
+            embedding_dim=embedding_dim,
+            num_heads=num_heads,
+            num_layers=num_layers,
+            device='cuda',
+            checkpoint_every=10000,
+            log_every=1000,
+            csv_log_path='training_log_gpu.csv'
+        )
+    else:
+        model = train_batched(
+            num_games=10000,
+            games_per_collection=50,
+            batch_size=128,
+            train_batches_per_collection=5,
+            learning_rate=0.00001,
+            epsilon_start=0.1,
+            epsilon_end=0.01,
+            epsilon_decay_games=25000,
+            embedding_dim=embedding_dim,
+            num_heads=num_heads,
+            num_layers=num_layers,
+            device='cpu',
+            checkpoint_every=1000,
+            log_every=100,
+            csv_log_path='training_log_cpu.csv'
+        )
+
     
     # Evaluate
     print("\n\nEvaluating final model...")
-    evaluate_model('final_model.pth', num_games=100, device='cuda')
+    evaluate_model('final_model.pth', 100, embedding_dim, num_heads, num_layers, DEVICE)
